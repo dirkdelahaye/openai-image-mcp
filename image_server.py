@@ -23,9 +23,12 @@ import os
 import re
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 
 from dotenv import load_dotenv
+from mcp import types
 from mcp.server.fastmcp import FastMCP, Image
+from mcp.server.fastmcp.resources import FileResource
 from openai import OpenAI
 from PIL import Image as PILImage
 
@@ -55,18 +58,46 @@ def _slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:40] or "image"
 
 
-def _save_and_preview(result, name_hint: str, output_format: str) -> list:
-    """Save every returned image to disk; return a text summary plus small previews."""
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+MIME = {"png": "image/png", "jpg": "image/jpeg", "webp": "image/webp",
+        "gif": "image/gif", "svg": "image/svg+xml"}
+
+
+def _target_paths(output_path: str | None, name_hint: str, ext: str, count: int) -> list[Path]:
+    """Work out where each image goes.
+
+    No output_path: OUTPUT_DIR/<timestamp>-<slug>.<ext>
+    A directory (existing, trailing slash, or no file extension): same name, in that directory.
+    A file path: used as given (extension corrected to the real format); -1, -2... when count > 1.
+    """
+    numbered = lambda i: f"-{i + 1}" if count > 1 else ""
+    p = Path(output_path).expanduser().resolve() if output_path else None
+    if p is None or p.is_dir() or output_path.endswith(("/", "\\")) or not p.suffix:
+        folder = p or OUTPUT_DIR
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        return [folder / f"{stamp}-{_slug(name_hint)}{numbered(i)}.{ext}" for i in range(count)]
+    return [p.with_name(f"{p.stem}{numbered(i)}.{ext}") for i in range(count)]
+
+
+def _publish(path: Path, ext: str) -> types.ResourceLink:
+    """Expose a saved file as an MCP resource and return a link to it."""
+    uri = f"image://{quote(path.name)}"
+    mcp.add_resource(FileResource(uri=uri, path=path, name=path.name,
+                                  mime_type=MIME[ext], is_binary=True))
+    return types.ResourceLink(type="resource_link", uri=uri, name=path.name,
+                              mimeType=MIME[ext], size=path.stat().st_size,
+                              description=str(path))
+
+
+def _save_and_preview(result, name_hint: str, output_format: str, output_path: str | None) -> list:
+    """Save every returned image; return a summary, resource links and small previews."""
     ext = "jpg" if output_format == "jpeg" else output_format
-    paths, previews = [], []
-    for i, item in enumerate(result.data):
+    paths = _target_paths(output_path, name_hint, ext, len(result.data))
+    links, previews = [], []
+    for item, path in zip(result.data, paths):
         raw = base64.b64decode(item.b64_json)
-        suffix = f"-{i + 1}" if len(result.data) > 1 else ""
-        path = OUTPUT_DIR / f"{stamp}-{_slug(name_hint)}{suffix}.{ext}"
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(raw)
-        paths.append(str(path))
+        links.append(_publish(path, ext))
 
         if ext == "svg":
             continue  # vector output: no raster preview
@@ -76,11 +107,11 @@ def _save_and_preview(result, name_hint: str, output_format: str) -> list:
         img.convert("RGB").save(buf, "JPEG", quality=80)
         previews.append(Image(data=buf.getvalue(), format="jpeg"))
 
-    summary = "Saved:\n" + "\n".join(paths)
+    summary = "Saved:\n" + "\n".join(map(str, paths))
     revised = [d.revised_prompt for d in result.data if getattr(d, "revised_prompt", None)]
     if revised:
         summary += "\nRevised prompt: " + revised[0]
-    return [summary, *previews]
+    return [summary, *links, *previews]
 
 
 def _common(size, quality, background, output_format, n, complexity):
@@ -107,6 +138,7 @@ def generate_image(
     output_format: str = "png",
     n: int = 1,
     complexity: str | None = None,
+    output_path: str | None = None,
     filename: str | None = None,
     model: str | None = None,
 ) -> list:
@@ -122,17 +154,20 @@ def generate_image(
             or "gif" (animated).
         n: Number of images (1-8).
         complexity: "low", "medium" or "high" (model default: high). Lower is simpler/faster.
+        output_path: Where to save, ideally an absolute path. A file path (e.g. the spot in your
+            project where the image belongs) is used as given and overwritten if it exists; a
+            directory gets an auto-named file. Default: the server's output folder.
         filename: Optional short name used in the saved file name.
         model: Override the model (default from IMAGE_MODEL).
 
-    Returns the saved file paths and small previews of each image.
+    Returns the saved file paths, an image:// resource link per file and small previews.
     """
     result = client().images.generate(
         model=model or DEFAULT_MODEL,
         prompt=prompt,
         **_common(size, quality, background, output_format, n, complexity),
     )
-    return _save_and_preview(result, filename or prompt, output_format)
+    return _save_and_preview(result, filename or prompt, output_format, output_path)
 
 
 @mcp.tool()
@@ -146,6 +181,7 @@ def edit_image(
     output_format: str = "png",
     n: int = 1,
     complexity: str | None = None,
+    output_path: str | None = None,
     filename: str | None = None,
     model: str | None = None,
 ) -> list:
@@ -156,10 +192,10 @@ def edit_image(
         image_paths: One or more local image file paths (png/jpg/webp) used as input/references.
         mask_path: Optional PNG with alpha channel; transparent areas mark where to edit.
             Applies to the first image and must match its size.
-        size, quality, background, output_format, n, complexity, filename, model: as in
+        size, quality, background, output_format, n, complexity, output_path, filename, model: as in
             generate_image (model defaults to IMAGE_EDIT_MODEL; svg output is not supported here).
 
-    Returns the saved file paths and small previews of each image.
+    Returns the saved file paths, an image:// resource link per file and small previews.
     """
     files = [open(Path(p).expanduser(), "rb") for p in image_paths]
     mask = open(Path(mask_path).expanduser(), "rb") if mask_path else None
@@ -177,7 +213,7 @@ def edit_image(
             f.close()
         if mask:
             mask.close()
-    return _save_and_preview(result, filename or prompt, output_format)
+    return _save_and_preview(result, filename or prompt, output_format, output_path)
 
 
 if __name__ == "__main__":

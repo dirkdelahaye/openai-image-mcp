@@ -10,15 +10,32 @@ automatically from the inline script metadata, so you don't need a virtualenv or
 
 | Tool | What it does |
 |---|---|
-| `generate_image(prompt, size, quality, background, output_format, n, complexity, filename, model)` | Text → image(s) |
+| `generate_image(prompt, size, quality, background, output_format, n, complexity, output_path, filename, model)` | Text → image(s) |
 | `edit_image(prompt, image_paths, mask_path, ...)` | Edit one image, or build a new one from several reference images |
 
 - `output_format`: `png`, `jpeg`, `webp`, `svg` (vector, generation only, `n=1`) or `gif` (animated)
 - `quality`: `auto`, `low`, `medium`, `high`, `xhigh`, `max`. Use `low` for drafts.
 - `complexity`: `low`, `medium`, `high` (the model's default is `high`)
 
-Images are saved to `output/` next to the script (change this with `IMAGE_OUTPUT_DIR`). Each call
-returns the saved file paths and a 512px preview of each raster image, so the agent can see the result.
+## How images reach the agent
+
+Each call returns three things:
+
+1. **The saved file path(s)** as text.
+2. **An MCP `resource_link`** per image (`image://<file name>`, with MIME type and size). Clients that
+   support resources can fetch the full image with `resources/read`, even without access to the disk.
+3. **A 512px preview** of each raster image, so the model can see what it made without spending
+   context on the full-size file.
+
+By default images go to `output/` next to the script (change this with `IMAGE_OUTPUT_DIR`). Pass
+`output_path` to save straight to where the image belongs, so the agent doesn't have to copy it:
+
+- a file path (`/repo/docs/img/logo.png`) is used as given and overwritten if it exists; the extension
+  is corrected to the real format, and `-1`, `-2`... are added when `n > 1`
+- a directory (existing, trailing slash, or no extension) gets an auto-named file
+
+Use absolute paths: relative paths resolve against the server's working directory, which depends
+on the client.
 
 ## Setup
 
