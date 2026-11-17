@@ -18,6 +18,7 @@ Config (env vars or a .env file next to this script):
 """
 
 import base64
+import functools
 import io
 import os
 import re
@@ -25,6 +26,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
+import anyio
 from dotenv import load_dotenv
 from mcp import types
 from mcp.server.fastmcp import FastMCP, Image
@@ -52,6 +54,20 @@ def client() -> OpenAI:
             raise RuntimeError(f"OPENAI_API_KEY is not set. Add it to {HERE / '.env'}.")
         _client = OpenAI()
     return _client
+
+
+def threaded(fn):
+    """Run a blocking tool in a worker thread.
+
+    FastMCP calls plain (sync) tools directly on the event loop, so one slow image call
+    blocks the whole server: parallel calls queue up and hit the client's timeout, and the
+    server can't even answer pings meanwhile. Wrapping the tool keeps its signature and
+    docstring but lets calls run side by side.
+    """
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        return await anyio.to_thread.run_sync(functools.partial(fn, *args, **kwargs))
+    return wrapper
 
 
 def _slug(text: str) -> str:
@@ -130,6 +146,7 @@ def _common(size, quality, background, output_format, n, complexity):
 
 
 @mcp.tool()
+@threaded
 def generate_image(
     prompt: str,
     size: str = "auto",
@@ -171,6 +188,7 @@ def generate_image(
 
 
 @mcp.tool()
+@threaded
 def edit_image(
     prompt: str,
     image_paths: list[str],
